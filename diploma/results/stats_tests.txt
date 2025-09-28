@@ -1,0 +1,8 @@
+Friedman test on roc_auc over 10 folds and 5 models:
+  chi2 = 34.000, p = 0.000001
+
+Post-hoc Wilcoxon (ENS vs base), Holm-corrected:
+  ENS_vs_LOGREG: p_raw=0.001953, p_holm=0.007812, significant=True, median_diff(ENS-base)=+0.0485
+  ENS_vs_RF: p_raw=0.001953, p_holm=0.007812, significant=True, median_diff(ENS-base)=-0.0152
+  ENS_vs_XGB: p_raw=0.322266, p_holm=0.464844, significant=False, median_diff(ENS-base)=+0.0011
+  ENS_vs_LGBM: p_raw=0.232422, p_holm=0.464844, significant=False, median_diff(ENS-base)=-0.0048

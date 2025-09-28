@@ -1,0 +1,4 @@
+[logreg] primary explainer failed: The passed link function needs to be callable!
+[rf] primary explainer failed: Only model_output="raw" is supported for feature_perturbation="tree_path_dependent"
+[xgb] primary explainer failed: Only model_output="raw" is supported for feature_perturbation="tree_path_dependent"
+[lgbm] primary explainer failed: Only model_output="raw" is supported for feature_perturbation="tree_path_dependent"
