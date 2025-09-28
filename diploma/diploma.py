@@ -18,6 +18,10 @@ import time
 import warnings
 warnings.filterwarnings("ignore")
 
+os.environ["MPLBACKEND"] = "Agg"
+import matplotlib
+matplotlib.use("Agg")
+
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -39,6 +43,8 @@ from imblearn.combine import SMOTEENN
 
 import joblib
 import matplotlib.pyplot as plt
+matplotlib.use("Agg")
+
 
 def _try_import(mod):
     try:
@@ -90,7 +96,6 @@ RENAME_MAP = {
 }
 APPLY_RENAME_MAP = True
 
-# ---------- utils ----------
 def results_dir() -> Path:
     out = Path(__file__).parent / "results"
     out.mkdir(parents=True, exist_ok=True)
@@ -136,7 +141,7 @@ def build_preprocessor(num_cols, cat_cols, encoding: str):
             ("cat", cat_pipe, cat_cols)
         ],
         remainder="drop",
-        verbose_feature_names_out=False,  # дає age, cp_0, ... замість довгих назв
+        verbose_feature_names_out=False,
     )
     return pre
 
@@ -279,7 +284,7 @@ def fit_with_tuning(model_name, base_pipeline, X, y, tuner="optuna", cv_splits=1
         return gs.best_estimator_, gs.best_params_
     elif tuner == "optuna":
         if not OPTUNA_OK:
-            raise RuntimeError("Optuna не встановлено; використайте --tuner grid")
+            raise RuntimeError("Optuna не встановлено; використайте --тuner grid")
         study = optuna.create_study(direction="maximize", sampler=TPESampler(seed=random_state))
         study.optimize(optuna_objective_factory(model_name, base_pipeline, X, y, cv), n_trials=30, show_progress_bar=False)
         best_params = study.best_params
@@ -291,7 +296,6 @@ def fit_with_tuning(model_name, base_pipeline, X, y, tuner="optuna", cv_splits=1
     else:
         base_pipeline.fit(X, y); return base_pipeline, None
 
-# ---------- main ----------
 def main():
     parser = argparse.ArgumentParser(description="Heart Disease Pipeline (leakage-free CV + SHAP)")
     parser.add_argument("--csv", type=str, default="heart.csv", help="Шлях до CSV (default: heart.csv поруч із скриптом).")
@@ -305,7 +309,6 @@ def main():
 
     out_dir = results_dir()
 
-    # Load
     csv_path = Path(args.csv)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV не знайдено: {args.csv}. Покладіть heart.csv поруч або вкажіть --csv шлях.")
@@ -313,12 +316,10 @@ def main():
     target = args.target_col or guess_target(df)
     Xdf, y, num_cols, cat_cols = split_cols(df, target)
 
-    # Split (без leakage)
     X_train_df, X_test_df, y_train, y_test = train_test_split(
         Xdf, y, test_size=args.test_size, stratify=y, random_state=args.random_state
     )
 
-    # Preprocessor і моделі
     pre = build_preprocessor(num_cols, cat_cols, args.encoding)
     class_weight_flag = (args.imbalance == "class_weight")
     models = get_models(class_weight=class_weight_flag, random_state=args.random_state)
@@ -328,7 +329,6 @@ def main():
     feature_names = None
     raw_names = None
 
-    # Train/tune кожну модель як pipeline(pre -> [resample] -> model)
     for name, model in models.items():
         base_pipe = build_pipeline(model, args.imbalance, pre, args.random_state)
         m_fitted, best_params = fit_with_tuning(
@@ -345,7 +345,6 @@ def main():
         except Exception:
             pass
 
-        # Predict on test
         if hasattr(m_fitted, "predict_proba"):
             y_prob = m_fitted.predict_proba(X_test_df)[:, 1]
         else:
@@ -353,10 +352,8 @@ def main():
             y_prob = (raw - raw.min()) / (raw.max() - raw.min() + 1e-12)
         y_pred = (y_prob >= 0.5).astype(int)
 
-        # Metrics
         m = metrics_dict(y_test, y_pred, y_prob)
 
-        # Save pipeline та latency (на трансформованих ознаках)
         model_path = out_dir / f"{name}.joblib"
         joblib.dump(m_fitted, model_path)
         size_mb = os.path.getsize(model_path) / (1024 * 1024)
@@ -367,7 +364,6 @@ def main():
         def _predict_wrapper(M, X):
             return M.predict_proba(X) if hasattr(M, "predict_proba") else M.predict(X)
 
-        # single latency
         t_single = []
         for _ in range(5):
             start = time.perf_counter()
@@ -375,7 +371,7 @@ def main():
                 _ = _predict_wrapper(est, Xt_test[i:i+1])
             t_single.append(time.perf_counter() - start)
         single_lat = float(np.median(t_single))
-        # batch latency
+
         t_batch = []
         for _ in range(5):
             start = time.perf_counter()
@@ -392,12 +388,10 @@ def main():
         results[name] = m
         trained[name] = m_fitted
 
-        # Plots
         cm = confusion_matrix(y_test, y_pred)
         plot_cm(cm, out_dir / f"{name}_cm.png")
         plot_roc(y_test, y_prob, out_dir / f"{name}_roc.png")
 
-    # Ensemble (soft voting)
     ens_members = []
     for k in ("xgb", "lgbm", "rf", "logreg"):
         if k in trained:
@@ -443,57 +437,91 @@ def main():
         plot_cm(cm, out_dir / "ensemble_soft_cm.png")
         plot_roc(y_test, y_prob, out_dir / "ensemble_soft_roc.png")
 
-    # ---------- XAI (SHAP) ----------
     xai = {}
     if SHAP_OK:
-        for nm in ["xgb", "lgbm", "rf"]:
-            if nm in trained:
+        err_lines = []
+        def _pick_feature_names(n_cols: int):
+            return (feature_names if feature_names is not None else
+                    (raw_names if raw_names is not None else [f"f{i}" for i in range(n_cols)]))
+
+        def _save_summary_plots(tag: str, shap_arr, X_df, out_dir: Path):
+            print(f"[XAI] Saving SHAP plots for {tag} ...")
+            plt.figure(); shap.summary_plot(shap_arr, X_df, show=False)
+            plt.tight_layout(); plt.savefig(out_dir / f"{tag}_shap_summary.png", dpi=160, bbox_inches="tight"); plt.close()
+            plt.figure(); shap.summary_plot(shap_arr, X_df, plot_type="bar", show=False)
+            plt.tight_layout(); plt.savefig(out_dir / f"{tag}_shap_bar.png", dpi=160, bbox_inches="tight"); plt.close()
+
+        def _as_pos_class(shap_vals):
+            if isinstance(shap_vals, list):
+                return shap_vals[1] if len(shap_vals) >= 2 else shap_vals[-1]
+            return shap_vals
+
+        for nm in ["logreg", "rf", "xgb", "lgbm"]:
+            if nm not in trained:
+                continue
+            try:
+                pipe  = trained[nm]
+                model = pipe.named_steps["model"]
+
+                Xt_train = pipe.named_steps["pre"].transform(X_train_df)
+                Xt_test  = pipe.named_steps["pre"].transform(X_test_df)
+
+                rng = np.random.RandomState(42)
+                xs_idx = rng.choice(np.arange(Xt_test.shape[0]),  size=min(200, Xt_test.shape[0]),  replace=False)
+                bg_idx = rng.choice(np.arange(Xt_train.shape[0]), size=min(100, Xt_train.shape[0]), replace=False)
+                Xs  = Xt_test[xs_idx]
+                Xbg = Xt_train[bg_idx]
+
+                fnames = _pick_feature_names(Xs.shape[1])
+                Xs_df  = pd.DataFrame(Xs,  columns=fnames)
+                Xbg_df = pd.DataFrame(Xbg, columns=fnames)
+                if APPLY_RENAME_MAP:
+                    Xs_df  = Xs_df.rename(columns=RENAME_MAP)
+                    Xbg_df = Xbg_df.rename(columns=RENAME_MAP)
+
+                print(f"[XAI] Explaining {nm} ...")
+
+                shap_arr = None
                 try:
-                    pipe = trained[nm]
-                    model = pipe.named_steps["model"]
-                    Xt_test = pipe.named_steps["pre"].transform(X_test_df)
+                    if nm in ["rf", "xgb", "lgbm"]:
+                        expl = shap.TreeExplainer(model, model_output="probability")
+                        shap_arr = _as_pos_class(expl.shap_values(Xs_df))
+                    elif nm == "logreg":
+                        expl = shap.LinearExplainer(model, Xbg_df, feature_perturbation="interventional", link="logit")
+                        shap_arr = _as_pos_class(expl.shap_values(Xs_df))
+                except Exception as e1:
+                    err_lines.append(f"[{nm}] primary explainer failed: {e1}")
+                    shap_arr = None
 
-                    rng = np.random.RandomState(42)
-                    idx = rng.choice(np.arange(Xt_test.shape[0]), size=min(200, Xt_test.shape[0]), replace=False)
-                    Xs = Xt_test[idx]
+                if shap_arr is None:
+                    f = (lambda data: model.predict_proba(np.asarray(data))[:, 1]) if hasattr(model, "predict_proba") \
+                        else (lambda data: model.decision_function(np.asarray(data)))
+                    expl_k = shap.KernelExplainer(f, Xbg_df)
+                    shap_arr = _as_pos_class(expl_k.shap_values(Xs_df, nsamples="auto"))
 
-                    fnames = feature_names if feature_names is not None else (
-                        raw_names if raw_names is not None else [f"f{i}" for i in range(Xs.shape[1])]
-                    )
-                    Xs_df = pd.DataFrame(Xs, columns=fnames)
-                    if APPLY_RENAME_MAP:
-                        Xs_df = Xs_df.rename(columns=RENAME_MAP)
+                mean_abs = (np.mean(np.abs(shap_arr), axis=0)).tolist()
+                xai[nm] = {"mean_abs_shap": mean_abs, "feature_names_used": list(Xs_df.columns)[:10]}
 
-                    explainer = shap.TreeExplainer(model, model_output="probability")
-                    shap_vals = explainer.shap_values(Xs_df)
+                _save_summary_plots(nm, shap_arr, Xs_df, out_dir)
+                print(f"[XAI] Done {nm}")
 
-                    mean_abs = (np.mean(np.abs(shap_vals), axis=0)).tolist()
-                    xai[nm] = {"mean_abs_shap": mean_abs, "feature_names_used": list(Xs_df.columns)[:10]}
+            except Exception as e:
+                msg = f"[{nm}] FAILED: {e}"
+                print(msg)
+                err_lines.append(msg)
+                xai[nm] = {"error": str(e)}
 
-                    plt.figure(); shap.summary_plot(shap_vals, Xs_df, show=False)
-                    plt.tight_layout(); plt.savefig(out_dir / f"{nm}_shap_summary.png", dpi=160, bbox_inches="tight"); plt.close()
-
-                    plt.figure(); shap.summary_plot(shap_vals, Xs_df, plot_type="bar", show=False)
-                    plt.tight_layout(); plt.savefig(out_dir / f"{nm}_shap_bar.png", dpi=160, bbox_inches="tight"); plt.close()
-                except Exception as e:
-                    xai[nm] = {"error": str(e)}
-
-        # ансамбль (KernelExplainer)
         if "ensemble_soft" in results and len(ens_members) >= 2:
             try:
                 ens_pipe = joblib.load(out_dir / "ensemble_soft.joblib")
-                rng = np.random.RandomState(42)
                 Xt_train = ens_pipe.named_steps["pre"].transform(X_train_df)
-                Xt_test = ens_pipe.named_steps["pre"].transform(X_test_df)
-
+                Xt_test  = ens_pipe.named_steps["pre"].transform(X_test_df)
+                rng = np.random.RandomState(42)
                 bg_idx = rng.choice(np.arange(Xt_train.shape[0]), size=min(100, Xt_train.shape[0]), replace=False)
-                X_bg = Xt_train[bg_idx]
-                xs_idx = rng.choice(np.arange(Xt_test.shape[0]), size=min(200, Xt_test.shape[0]), replace=False)
-                Xs = Xt_test[xs_idx]
+                xs_idx = rng.choice(np.arange(Xt_test.shape[0]),  size=min(200, Xt_test.shape[0]),  replace=False)
+                X_bg = Xt_train[bg_idx]; Xs = Xt_test[xs_idx]
 
-                fnames = feature_names if feature_names is not None else (
-                    raw_names if raw_names is not None else [f"f{i}" for i in range(Xs.shape[1])]
-                )
+                fnames = _pick_feature_names(Xs.shape[1])
                 X_bg_df = pd.DataFrame(X_bg, columns=fnames)
                 Xs_df   = pd.DataFrame(Xs,   columns=fnames)
                 if APPLY_RENAME_MAP:
@@ -502,22 +530,127 @@ def main():
 
                 f_ens = lambda data: ens_pipe.named_steps["model"].predict_proba(np.asarray(data))[:, 1]
                 expl_ens = shap.KernelExplainer(f_ens, X_bg_df)
-                shap_vals_ens = expl_ens.shap_values(Xs_df, nsamples="auto")
+                shap_arr_ens = _as_pos_class(expl_ens.shap_values(Xs_df, nsamples="auto"))
 
                 xai["ensemble_soft"] = {
-                    "mean_abs_shap": (np.mean(np.abs(shap_vals_ens), axis=0)).tolist(),
+                    "mean_abs_shap": (np.mean(np.abs(shap_arr_ens), axis=0)).tolist(),
                     "feature_names_used": list(Xs_df.columns)[:10]
                 }
 
-                plt.figure(); shap.summary_plot(shap_vals_ens, Xs_df, show=False)
-                plt.tight_layout(); plt.savefig(out_dir / "ensemble_soft_shap_summary.png", dpi=160, bbox_inches="tight"); plt.close()
+                _save_summary_plots("ensemble_soft", shap_arr_ens, Xs_df, out_dir)
+                print("[XAI] Done ensemble_soft")
 
-                plt.figure(); shap.summary_plot(shap_vals_ens, Xs_df, plot_type="bar", show=False)
-                plt.tight_layout(); plt.savefig(out_dir / "ensemble_soft_shap_bar.png", dpi=160, bbox_inches="tight"); plt.close()
             except Exception as e:
+                msg = f"[ensemble_soft] FAILED: {e}"
+                print(msg)
+                err_lines.append(msg)
                 xai["ensemble_soft"] = {"error": str(e)}
 
-    # Save summary JSON
+        if err_lines:
+            with open(out_dir / "xai_errors.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(err_lines))
+
+    from scipy.stats import friedmanchisquare, wilcoxon
+    from statsmodels.stats.multitest import multipletests
+
+    try:
+        import scikit_posthocs as sp
+        HAS_SCPH = True
+    except Exception:
+        HAS_SCPH = False
+
+    def rebuild_fixed_pipeline(trained_pipe):
+        pre_fitted = trained_pipe.named_steps["pre"]
+        est_fitted = trained_pipe.named_steps["model"]
+        EstClass = est_fitted.__class__
+        est_new = EstClass(**est_fitted.get_params())
+        return build_pipeline(est_new, args.imbalance, pre, args.random_state)
+
+    compare_names = [m for m in ["logreg", "rf", "xgb", "lgbm"] if m in trained]
+    if "ensemble_soft" in results and len(compare_names) >= 1:
+        compare_names.append("ensemble_soft")
+
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=args.random_state)
+
+    metrics_to_run = {
+        "roc_auc": "roc_auc",
+        "f1": "f1",
+        "accuracy": "accuracy"
+    }
+
+    cv_scores = {}
+    for nm in compare_names:
+        if nm == "ensemble_soft":
+            ests = []
+            for k in ["xgb", "lgbm", "rf", "logreg"]:
+                if k in trained:
+                    ests.append((k, trained[k].named_steps["model"].__class__(**trained[k].named_steps["model"].get_params())))
+            ens_fixed = VotingClassifier(estimators=ests, voting="soft", n_jobs=-1)
+            pipe_cv = build_pipeline(ens_fixed, args.imbalance, pre, args.random_state)
+        else:
+            pipe_cv = rebuild_fixed_pipeline(trained[nm])
+
+        cv_scores[nm] = {}
+        for mname, scorer in metrics_to_run.items():
+            scores = cross_val_score(pipe_cv, Xdf, y, cv=cv, scoring=scorer, n_jobs=-1)
+            cv_scores[nm][mname] = scores
+            print(f"[CV] {nm} {mname}: mean={scores.mean():.3f} ± {scores.std():.3f}")
+
+    rows = []
+    for nm in cv_scores:
+        for metric in cv_scores[nm]:
+            for i, v in enumerate(cv_scores[nm][metric], 1):
+                rows.append({"model": nm, "metric": metric, "fold": i, "score": float(v)})
+    df_cv = pd.DataFrame(rows)
+    df_cv.to_csv(out_dir / "cv_metrics.csv", index=False)
+
+    metric_main = "roc_auc"
+    base_order = compare_names
+    mat = np.column_stack([cv_scores[nm][metric_main] for nm in base_order])
+    chi2, p_friedman = friedmanchisquare(*[mat[:, j] for j in range(mat.shape[1])])
+
+    pairs = []
+    if "ensemble_soft" in base_order:
+        ens_vec = cv_scores["ensemble_soft"][metric_main]
+        for nm in base_order:
+            if nm == "ensemble_soft":
+                continue
+            w = wilcoxon(ens_vec, cv_scores[nm][metric_main], alternative="two-sided", zero_method="wilcox")
+            pairs.append((f"ENS_vs_{nm.upper()}", w.pvalue, float(np.median(ens_vec - cv_scores[nm][metric_main]))))
+
+    labels = [p[0] for p in pairs]
+    p_raw = np.array([p[1] for p in pairs]) if pairs else np.array([])
+    med_diff = np.array([p[2] for p in pairs]) if pairs else np.array([])
+
+    if p_raw.size > 0:
+        rej, p_holm, _, _ = multipletests(p_raw, alpha=0.05, method="holm")
+    else:
+        rej, p_holm = np.array([]), np.array([])
+
+    nemenyi_csv = None
+    if HAS_SCPH:
+        data_for_nemenyi = mat
+        nemenyi = sp.posthoc_nemenyi_friedman(data_for_nemenyi)
+        nemenyi.index = base_order; nemenyi.columns = base_order
+        nemenyi_csv = out_dir / "nemenyi_pvalues.csv"
+        nemenyi.to_csv(nemenyi_csv)
+
+    lines = []
+    lines.append(f"Friedman test on {metric_main} over 10 folds and {len(base_order)} models:")
+    lines.append(f"  chi2 = {chi2:.3f}, p = {p_friedman:.6f}")
+    lines.append("")
+    if p_raw.size > 0:
+        lines.append("Post-hoc Wilcoxon (ENS vs base), Holm-corrected:")
+        for name, p0, ph, sig, md in zip(labels, p_raw, p_holm, rej, med_diff):
+            lines.append(f"  {name}: p_raw={p0:.6f}, p_holm={ph:.6f}, significant={bool(sig)}, median_diff(ENS-base)={md:+.4f}")
+        lines.append("")
+    if nemenyi_csv is not None:
+        lines.append(f"Nemenyi p-values saved to: {nemenyi_csv.name}")
+    with open(out_dir / "stats_tests.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print("\n".join(lines))
+
     summary = {
         "target": target,
         "encoding": args.encoding,
